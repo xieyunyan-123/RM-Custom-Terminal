@@ -1,0 +1,743 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4d6ffbc..5bab9d3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+ 
+ find_package(Threads REQUIRED)
+-find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui)
++find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui imgcodecs)
+ 
+ set(SERIAL_LIB_SOURCES
+   third_party/serial/src/serial.cc
+@@ -76,4 +76,8 @@ target_link_libraries(minimal_hik_gimbal_bridge PRIVATE
+ 
+ set_target_properties(minimal_hik_gimbal_bridge PROPERTIES
+   BUILD_RPATH "${HIKROBOT_SDK_DIR}/lib/${HIKROBOT_LIB_ARCH}"
+-)
+\ No newline at end of file
++)
++
++add_executable(capture_hik_frame tools/capture_hik_frame.cpp)
++target_link_libraries(capture_hik_frame PRIVATE minimal_hik_gimbal_bridge_core)
++target_include_directories(capture_hik_frame PRIVATE ${OpenCV_INCLUDE_DIRS})
+diff --git a/bridge/frame_preprocessor.cpp b/bridge/frame_preprocessor.cpp
+index 97098aa..089692e 100644
+--- a/bridge/frame_preprocessor.cpp
++++ b/bridge/frame_preprocessor.cpp
+@@ -63,6 +63,7 @@ cv::Mat apply_rotation_matrix_bgr(const cv::Mat & input_bgr, const std::array<do
+ 
+ FramePreprocessor::FramePreprocessor(const Options & options)
+ : rotation_matrix_(options.rotation_matrix),
++  full_view_(options.full_view),
+   crop_size_(std::max(0, options.crop_size)),
+   crop_center_x_(std::clamp(options.crop_center_x, 0.0, 1.0)),
+   crop_center_y_(std::clamp(options.crop_center_y, 0.0, 1.0)),
+@@ -122,27 +123,35 @@ cv::Mat FramePreprocessor::process_rgb24(const FrameInfo & frame)
+     CV_8UC3,
+     const_cast<uint8_t *>(frame.rgb24.data()));
+   cv::Mat input_bgr;
+-  cv::cvtColor(input_rgb, input_bgr, cv::COLOR_RGB2BGR);
++  cv::cvtColor(input_rgb, input_bgr,
++               force_monochrome_ ? cv::COLOR_RGB2GRAY : cv::COLOR_RGB2BGR);
+   cv::Mat rotated_bgr = apply_rotation_matrix_bgr(input_bgr, rotation_matrix_);
+ 
+-  const auto crop_region = compute_square_crop_region(
+-    rotated_bgr.size(), crop_size_, crop_center_x_, crop_center_y_);
+-  if (crop_region.rect.width <= 0 || crop_region.rect.height <= 0) {
+-    return {};
+-  }
+-  cv::Mat cropped = rotated_bgr(crop_region.rect);
+-
+-  cv::Mat resized;
+-  cv::resize(cropped, resized, cv::Size(output_size_, output_size_), 0, 0, cv::INTER_LINEAR);
+-  cv::Mat working = resized;
+-
+-  if (force_monochrome_) {
+-    cv::Mat gray;
+-    cv::cvtColor(working, gray, cv::COLOR_BGR2GRAY);
+-    cv::cvtColor(gray, working, cv::COLOR_GRAY2BGR);
++  cv::Mat working;
++  if (full_view_) {
++    const double scale = static_cast<double>(output_size_) /
++      std::max(rotated_bgr.cols, rotated_bgr.rows);
++    const int width = std::max(1, cvRound(rotated_bgr.cols * scale));
++    const int height = std::max(1, cvRound(rotated_bgr.rows * scale));
++    const int left = (output_size_ - width) / 2;
++    const int top = (output_size_ - height) / 2;
++    cv::Mat resized;
++    cv::resize(rotated_bgr, resized, cv::Size(width, height), 0, 0,
++               scale < 1.0 ? cv::INTER_AREA : cv::INTER_LINEAR);
++    cv::copyMakeBorder(resized, working, top, output_size_ - height - top,
++                       left, output_size_ - width - left,
++                       cv::BORDER_CONSTANT, cv::Scalar::all(0));
++  } else {
++    const auto crop_region = compute_square_crop_region(
++      rotated_bgr.size(), crop_size_, crop_center_x_, crop_center_y_);
++    if (crop_region.rect.width <= 0 || crop_region.rect.height <= 0) {
++      return {};
++    }
++    cv::resize(rotated_bgr(crop_region.rect), working,
++               cv::Size(output_size_, output_size_), 0, 0, cv::INTER_LINEAR);
+   }
+ 
+-  if (center_clear_radius_ > 0) {
++  if (!full_view_ && center_clear_radius_ > 0) {
+     cv::Mat detail_blur;
+     cv::Mat detailed_focus;
+     cv::GaussianBlur(working, detail_blur, cv::Size(), 0.85, 0.85);
+@@ -160,7 +169,11 @@ cv::Mat FramePreprocessor::process_rgb24(const FrameInfo & frame)
+   }
+ 
+   cv::Mat gray;
+-  cv::cvtColor(working, gray, cv::COLOR_BGR2GRAY);
++  if (force_monochrome_) {
++    gray = working;
++  } else {
++    cv::cvtColor(working, gray, cv::COLOR_BGR2GRAY);
++  }
+   if (background_gray_f32_.empty() || background_gray_f32_.size() != gray.size()) {
+     reset_history();
+     gray.convertTo(background_gray_f32_, CV_32F);
+diff --git a/bridge/frame_preprocessor.hpp b/bridge/frame_preprocessor.hpp
+index c553107..fa9e08d 100644
+--- a/bridge/frame_preprocessor.hpp
++++ b/bridge/frame_preprocessor.hpp
+@@ -25,6 +25,7 @@ private:
+   cv::Mat center_circle_mask(const cv::Size & size);
+ 
+   std::array<double, 4> rotation_matrix_ = {1.0, 0.0, 0.0, 1.0};
++  bool full_view_ = false;
+   int crop_size_ = 0;
+   double crop_center_x_ = 0.5;
+   double crop_center_y_ = 0.5;
+diff --git a/bridge/h264_encoder.cpp b/bridge/h264_encoder.cpp
+index ad3ee72..93a3748 100644
+--- a/bridge/h264_encoder.cpp
++++ b/bridge/h264_encoder.cpp
+@@ -96,41 +96,51 @@ void H264EncoderProcess::start(uint16_t width, uint16_t height, const Options &
+   }
+ 
+   const auto clamped_size = std::clamp(options.video_size, 120, 480);
+-  const auto clamped_fps = std::clamp(options.video_fps, 10, 60);
++  const int fps = options.video_fps;
+   const auto clamped_bitrate = std::clamp(options.video_bitrate_kbps, 40, 116);
+-  const auto clamped_gop = std::clamp(options.video_gop, 1, clamped_fps * 12);
++  const auto clamped_gop = std::clamp(options.video_gop, 1, fps * 12);
+   const std::string input_size = std::to_string(width) + "x" + std::to_string(height);
+-  const std::string video_filter =
+-    "hqdn3d=4:3:6:4,"
+-    "eq=contrast=1.12:saturation=0.75:gamma=1.05,"
+-    "format=yuv420p";
++  std::string video_filter;
++  if (options.video_denoise == "standard") {
++    video_filter = "hqdn3d=4:3:6:4,";
++  } else if (options.video_denoise == "light") {
++    video_filter = "hqdn3d=1.5:1.0:2.0:1.2,";
++  }
++  const bool monochrome = options.force_monochrome;
++  const std::string output_format = monochrome ? "gray" : "yuv420p";
++  video_filter += options.lift_shadows
++    ? "eq=contrast=1.0:saturation=0.75:gamma=1.75:gamma_weight=0.85"
++    : "eq=contrast=1.12:saturation=0.75:gamma=1.05";
++  video_filter += ",format=" + output_format;
+   const std::string x264_params =
+-    "repeat-headers=1:nal-hrd=cbr:force-cfr=1:ref=1:slice-max-size=" +
+-    std::to_string(kTargetSliceMaxBytes);
++    std::string("repeat-headers=1:force-cfr=1:ref=1:") +
++    (monochrome ? "ipratio=1.10:sliced-threads=0:" : "nal-hrd=cbr:") +
++    "slice-max-size=" + std::to_string(kTargetSliceMaxBytes);
++  const std::string bitrate = std::to_string(clamped_bitrate) + "k";
+ 
+   std::vector<std::string> args = {
+     options.ffmpeg_path,
+     "-hide_banner",
+     "-loglevel", "warning",
+     "-f", "rawvideo",
+-    "-pix_fmt", "bgr24",
++    "-pix_fmt", monochrome ? "gray" : "bgr24",
+     "-s", input_size,
+-    "-r", std::to_string(clamped_fps),
++    "-r", std::to_string(fps),
+     "-i", "pipe:0",
+     "-an",
+     "-vf", video_filter,
+     "-c:v", "libx264",
+-    "-preset", "veryslow",
++    "-preset", monochrome ? "fast" : "veryslow",
+     "-tune", "zerolatency",
+-    "-b:v", std::to_string(clamped_bitrate) + "k",
+-    "-maxrate", std::to_string(clamped_bitrate) + "k",
+-    "-bufsize", std::to_string(clamped_bitrate) + "k",
++    monochrome ? "-crf" : "-b:v", monochrome ? "28" : bitrate,
++    "-maxrate", bitrate,
++    "-bufsize", monochrome ? std::to_string(clamped_bitrate / 2) + "k" : bitrate,
+     "-g", std::to_string(clamped_gop),
+     "-keyint_min", std::to_string(clamped_gop),
+     "-sc_threshold", "0",
+     "-bf", "0",
+     "-x264-params", x264_params,
+-    "-pix_fmt", "yuv420p",
++    "-pix_fmt", output_format,
+     "-f", "h264",
+     "pipe:1"};
+ 
+@@ -173,8 +183,10 @@ void H264EncoderProcess::start(uint16_t width, uint16_t height, const Options &
+ 
+   std::cout << "[video-0310] ffmpeg started input=" << input_size
+             << " output=" << clamped_size << "x" << clamped_size
+-            << " fps=" << clamped_fps
+-            << " bitrate=" << clamped_bitrate << "kbit/s"
++            << " fps=" << fps
++            << " pixel_format=" << output_format
++            << " rate_control=" << (monochrome ? "capped-crf" : "cbr")
++            << " bitrate_cap=" << clamped_bitrate << "kbit/s"
+             << " gop=" << clamped_gop
+             << " slice_max=" << kTargetSliceMaxBytes << "B" << std::endl;
+ }
+@@ -209,7 +221,7 @@ void H264EncoderProcess::stop()
+   encoded_buffer_.clear();
+ }
+ 
+-bool H264EncoderProcess::submit_rgb_frame(const std::vector<uint8_t> & frame)
++bool H264EncoderProcess::submit_frame(const std::vector<uint8_t> & frame)
+ {
+   if (stdin_fd_ < 0 || frame.empty()) {
+     return false;
+@@ -244,12 +256,8 @@ bool H264EncoderProcess::pop_chunk(
+     return false;
+   }
+ 
+-  AnnexBStartCode start_code{};
+-  if (find_annexb_start_code(encoded_buffer_, 0, start_code) && start_code.offset > 0) {
+-    encoded_buffer_.erase(
+-      encoded_buffer_.begin(),
+-      encoded_buffer_.begin() + static_cast<long>(start_code.offset));
+-  }
++  // A previous chunk may end inside a large NAL. Keep its remaining bytes:
++  // the receiver reconstructs a continuous Annex-B stream across packets.
+ 
+   std::size_t packet_bytes = 0;
+   while (!encoded_buffer_.empty()) {
+diff --git a/bridge/h264_encoder.hpp b/bridge/h264_encoder.hpp
+index 91bc475..f7dfea0 100644
+--- a/bridge/h264_encoder.hpp
++++ b/bridge/h264_encoder.hpp
+@@ -26,7 +26,7 @@ public:
+ 
+   void start(uint16_t width, uint16_t height, const Options & options);
+   void stop();
+-  bool submit_rgb_frame(const std::vector<uint8_t> & frame);
++  bool submit_frame(const std::vector<uint8_t> & frame);
+   bool pop_chunk(
+     std::array<uint8_t, protocol::kCustomClientVideo0310PayloadBytes> & chunk,
+     std::size_t & chunk_size);
+diff --git a/bridge/options.cpp b/bridge/options.cpp
+index 72c3b9b..0aacde0 100644
+--- a/bridge/options.cpp
++++ b/bridge/options.cpp
+@@ -155,6 +155,9 @@ void print_help()
+     << "  --video-fps <n>          0310 视频编码帧率，默认 30\n"
+     << "  --video-bitrate-kbps <n> 0310 视频目标码率，默认 116 kbit/s\n"
+     << "  --video-gop <n>          H264 GOP，默认 10\n"
++    << "  --video-denoise <mode>  编码前降噪：off、light、standard（默认）\n"
++    << "  --lift-shadows         提亮视频暗部和中间调\n"
++    << "  --full-view            Letterbox the complete image without cropping\n"
+     << "  --crop-size <n>          预处理中心裁剪边长，0 表示自动取最小边\n"
+     << "  --static-simplify        开启静态区域简化预处理，默认开启\n"
+     << "  --no-static-simplify     显式关闭静态区域简化预处理\n"
+@@ -167,7 +170,7 @@ void print_help()
+     << "  --bg-blur-sigma <f>      静态区域模糊 sigma，默认 1.5\n"
+     << "  --center-clear-size <n>  中心保护区边长，默认 180\n"
+     << "  --center-clear-radius <n>中心圆形保真半径，默认 112；大于 0 时圆外压黑\n"
+-    << "  --force-monochrome       预处理后强制灰度\n"
++    << "  --force-monochrome       单通道灰度预处理和 H.264 编码\n"
+     << "  --test-pattern           无相机时使用内置测试图案源\n"
+     << "  --preview                显示相机原画面，并在窗口内调曝光/增益，按 S 保存 YAML\n"
+     << "  --viewer-ip <ip>         可选 0x0310 UDP 调试目标 IP，默认关闭\n"
+@@ -252,6 +255,16 @@ Options parse_args(int argc, char ** argv)
+       options.video_bitrate_kbps = static_cast<int>(parse_u32(require_value("--video-bitrate-kbps")));
+     } else if (arg == "--video-gop") {
+       options.video_gop = static_cast<int>(parse_u32(require_value("--video-gop")));
++    } else if (arg == "--video-denoise") {
++      options.video_denoise = require_value("--video-denoise");
++      if (options.video_denoise != "off" && options.video_denoise != "light" &&
++          options.video_denoise != "standard") {
++        throw std::runtime_error("--video-denoise requires off, light, or standard");
++      }
++    } else if (arg == "--lift-shadows") {
++      options.lift_shadows = true;
++    } else if (arg == "--full-view") {
++      options.full_view = true;
+     } else if (arg == "--crop-size") {
+       options.crop_size = static_cast<int>(parse_u32(require_value("--crop-size")));
+     } else if (arg == "--static-simplify") {
+@@ -298,6 +311,7 @@ Options parse_args(int argc, char ** argv)
+     }
+   }
+ 
++  options.video_fps = std::clamp(options.video_fps, 5, 60);
+   return options;
+ }
+ 
+diff --git a/bridge/options.hpp b/bridge/options.hpp
+index fbcc562..a8bd4c2 100644
+--- a/bridge/options.hpp
++++ b/bridge/options.hpp
+@@ -22,6 +22,9 @@ struct Options
+   int video_fps = 30;
+   int video_bitrate_kbps = 116;
+   int video_gop = 10;
++  std::string video_denoise = "standard";
++  bool lift_shadows = false;
++  bool full_view = false;
+   int crop_size = 0;
+   bool static_simplify = true;
+   int motion_threshold = 14;
+diff --git a/deploy/onboard/hik-gimbal-bridge.service b/deploy/onboard/hik-gimbal-bridge.service
+new file mode 100644
+index 0000000..fd0a5f1
+--- /dev/null
++++ b/deploy/onboard/hik-gimbal-bridge.service
+@@ -0,0 +1,18 @@
++[Unit]
++Description=Hik camera H264 and RoboMaster 0310 serial bridge
++
++[Service]
++Type=simple
++User=robot
++Group=robot
++WorkingDirectory=/opt/rm-hik-bridge
++ExecStart=/opt/rm-hik-bridge/scripts/run-onboard.sh --video-serial /dev/ttyUSB0
++Restart=on-failure
++RestartSec=2
++KillMode=mixed
++TimeoutStopSec=10
++StandardOutput=append:/opt/rm-hik-bridge/logs/live-serial.log
++StandardError=inherit
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/scripts/run-onboard.sh b/scripts/run-onboard.sh
+new file mode 100644
+index 0000000..7cc0017
+--- /dev/null
++++ b/scripts/run-onboard.sh
+@@ -0,0 +1,15 @@
++#!/usr/bin/env bash
++set -euo pipefail
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++PROJECT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
++export SYSTEM_MVS_RUNTIME_PATH="${SYSTEM_MVS_RUNTIME_PATH:-/opt/MVS/lib/aarch64}"
++case "${RM_BRIDGE_VIEW:-full}" in
++  full) view_args=(--full-view) ;;
++  detail) view_args=(--crop-size 800) ;;
++  wide) view_args=(--crop-size 0) ;;
++  *) printf "RM_BRIDGE_VIEW must be full, detail, or wide\n" >&2; exit 2 ;;
++esac
++exec "$SCRIPT_DIR/run-bridge.sh" \
++  --config "$PROJECT_DIR/config/bridge.onboard.yaml" \
++  --video-size 360 --video-fps 8 --video-bitrate-kbps 80 --video-gop 8 --send-interval-ms 20 \
++  "${view_args[@]}" --video-denoise "${RM_BRIDGE_DENOISE:-light}" --static-simplify --motion-threshold 14 --motion-erode-px 2 --motion-dilate-px 6 --bg-blur-sigma 1.5 --lift-shadows "$@"
+diff --git a/src/main.cpp b/src/main.cpp
+index 314c1c2..4d1792a 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -159,6 +159,8 @@ int main(int argc, char ** argv)
+     std::atomic_bool video_reset_pending = true;
+     auto last_video_submit = bridge::Clock::time_point{};
+     std::atomic_uint32_t sent_packets = 0;
++    std::atomic_uint32_t serial_written_packets = 0;
++    std::atomic_uint32_t serial_write_errors = 0;
+     uint32_t frames_in_window = 0;
+     double fps = 0.0;
+     auto last_report = bridge::Clock::now();
+@@ -187,7 +189,8 @@ int main(int argc, char ** argv)
+       }
+     };
+ 
+-    std::cout << "[bridge] preprocess crop=" << options.crop_size
++    std::cout << "[bridge] preprocess view=" << (options.full_view ? "full" : "square")
++              << " crop=" << options.crop_size
+               << " output=" << preprocessor.output_size() << 'x' << preprocessor.output_size()
+               << " center_circle_radius=" << options.center_clear_radius
+               << " static_simplify=" << (options.static_simplify ? "on" : "off")
+@@ -210,9 +213,8 @@ int main(int argc, char ** argv)
+           std::this_thread::sleep_until(next_send);
+           continue;
+         }
+-        while (next_send <= now) {
+-          next_send += send_interval;
+-        }
++        // Start a fresh interval after a late wakeup instead of catching up.
++        next_send = now + send_interval;
+ 
+         if (!options.video_serial.empty() && !video_serial.is_open() && now >= next_video_serial_retry) {
+           try {
+@@ -256,7 +258,9 @@ int main(int argc, char ** argv)
+               reinterpret_cast<const uint8_t *>(&packet),
+               sizeof(packet));
+             video_serial.write_all(ref_frame, ref_len);
++            serial_written_packets.fetch_add(1);
+           } catch (const std::exception & error) {
++            serial_write_errors.fetch_add(1);
+             video_serial.close();
+             next_video_serial_retry = now + bridge::kDeviceReconnectInterval;
+             if (bridge::should_log_at_interval(now, last_video_serial_write_error, bridge::kReconnectLogInterval)) {
+@@ -282,7 +286,7 @@ int main(int argc, char ** argv)
+       const bool need_rgb24 = true;
+       if (options.test_pattern) {
+         const auto test_frame_interval = std::chrono::milliseconds(
+-          std::max(1, 1000 / std::clamp(options.video_fps, 1, 120)));
++          std::max(1, 1000 / options.video_fps));
+         if (last_test_frame == bridge::Clock::time_point{} || now - last_test_frame >= test_frame_interval) {
+           frame = bridge::make_test_pattern_frame(test_pattern_sequence++, now);
+           last_test_frame = now;
+@@ -318,7 +322,7 @@ int main(int argc, char ** argv)
+           }
+ 
+           const auto frame_interval = std::chrono::milliseconds(
+-            std::max(1, 1000 / std::clamp(options.video_fps, 1, 120)));
++            std::max(1, 1000 / options.video_fps));
+           if (last_video_submit == bridge::Clock::time_point{} || now - last_video_submit >= frame_interval) {
+             cv::Mat processed = preprocessor.process_rgb24(latest_frame);
+             std::vector<uint8_t> processed_bytes;
+@@ -329,7 +333,7 @@ int main(int argc, char ** argv)
+               processed_bytes.assign(processed.datastart, processed.dataend);
+             }
+ 
+-            if (processed_bytes.empty() || !video_encoder.submit_rgb_frame(processed_bytes)) {
++            if (processed_bytes.empty() || !video_encoder.submit_frame(processed_bytes)) {
+               std::cerr << "[video-0310] ffmpeg stdin closed, restarting encoder" << std::endl;
+               video_encoder.start(
+                 static_cast<uint16_t>(preprocessor.output_size()),
+@@ -360,6 +364,8 @@ int main(int argc, char ** argv)
+                   << " camera=" << (options.test_pattern ? "test" : (camera.is_open() ? "online" : "reconnecting"))
+                   << " fps=" << std::fixed << std::setprecision(1) << fps
+                   << " sent=" << sent_packets.load()
++                  << " serial_written=" << serial_written_packets.load()
++                  << " serial_errors=" << serial_write_errors.load()
+                   << " video_tx=" << (video_serial.is_open() ? "online" : "reconnecting")
+                   << " video_backlog=" << video_encoder.queued_bytes()
+                   << " video_seq=" << video_sequence.load();
+@@ -372,6 +378,9 @@ int main(int argc, char ** argv)
+     if (sender_thread.joinable()) {
+       sender_thread.join();
+     }
++    std::cout << "[bridge] stopped sent=" << sent_packets.load()
++              << " serial_written=" << serial_written_packets.load()
++              << " serial_errors=" << serial_write_errors.load() << std::endl;
+     return 0;
+   } catch (const std::exception & error) {
+     g_running = false;
+diff --git a/tools/capture_hik_frame.cpp b/tools/capture_hik_frame.cpp
+new file mode 100644
+index 0000000..fe65e6a
+--- /dev/null
++++ b/tools/capture_hik_frame.cpp
+@@ -0,0 +1,43 @@
++#include "bridge/hik_camera.hpp"
++#include "bridge/options.hpp"
++#include <opencv2/imgcodecs.hpp>
++#include <opencv2/imgproc.hpp>
++#include <chrono>
++#include <filesystem>
++#include <iostream>
++
++int main(int argc, char **argv)
++{
++  if (argc < 2) {
++    std::cerr << "Usage: capture_hik_frame OUTPUT.png [--config PATH] [--camera-serial SERIAL]"
++                 " [--exposure-ms MS] [--gain GAIN]\n";
++    return 2;
++  }
++  try {
++    const std::filesystem::path output(argv[1]);
++    const auto options = bridge::parse_args(argc - 1, argv + 1);
++    bridge::HikCamera camera;
++    camera.open_first(options.exposure_ms, options.gain, options.camera_serial_number);
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++    bridge::FrameInfo frame;
++    while (std::chrono::steady_clock::now() < deadline) {
++      const auto result = camera.grab(frame, 200, true);
++      if (result == bridge::CameraGrabResult::DeviceError) {
++        throw std::runtime_error(camera.last_error());
++      }
++      if (result != bridge::CameraGrabResult::Success) continue;
++      cv::Mat rgb(frame.height, frame.width, CV_8UC3, frame.rgb24.data());
++      cv::Mat bgr;
++      cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
++      if (output.has_parent_path()) std::filesystem::create_directories(output.parent_path());
++      if (!cv::imwrite(output.string(), bgr)) throw std::runtime_error("image write failed");
++      std::cout << "Saved " << output << " " << frame.width << 'x' << frame.height
++                << " frame=" << frame.sequence << '\n';
++      return 0;
++    }
++    throw std::runtime_error("camera frame timeout");
++  } catch (const std::exception &error) {
++    std::cerr << error.what() << '\n';
++    return 1;
++  }
++}
+diff --git a/tools/onboard_camera_smoke.py b/tools/onboard_camera_smoke.py
+new file mode 100644
+index 0000000..6e4c1a2
+--- /dev/null
++++ b/tools/onboard_camera_smoke.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python3
++"""Verify a real onboard camera -> H264 -> 0310 -> PTY, without extra Python packages."""
++import argparse
++from datetime import datetime
++import json
++import os
++from pathlib import Path
++import pty
++import re
++import select
++import signal
++import subprocess
++import time
++import tty
++
++
++def crc(data, initial, poly, width):
++    value = initial
++    for byte in data:
++        value ^= byte
++        for _ in range(8):
++            value = (value >> 1) ^ (poly if value & 1 else 0)
++    return value & ((1 << width) - 1)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--duration', type=float, default=15)
++    args = parser.parse_args()
++    root = Path(__file__).resolve().parents[1]
++    output = root / 'logs' / ('camera-smoke-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
++    output.mkdir(parents=True)
++    master, slave = pty.openpty()
++    tty.setraw(slave)
++    stats = dict(packets=0, crc8_errors=0, crc16_errors=0, invalid_length=0,
++                 sequence_gaps=0, h264_bytes=0)
++    last_sequence = None
++    buffer = bytearray()
++    captured = bytearray()
++    command = [str(root / 'scripts/run-onboard.sh'), '--video-serial', os.ttyname(slave)]
++    log = (output / 'bridge.log').open('w')
++    proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=root)
++    try:
++        deadline = time.monotonic() + args.duration
++        with (output / 'serial.bin').open('wb') as raw:
++            while time.monotonic() < deadline:
++                if proc.poll() is not None:
++                    break
++                ready, _, _ = select.select([master], [], [], 0.2)
++                if not ready:
++                    continue
++                data = os.read(master, 65536)
++                raw.write(data)
++                buffer.extend(data)
++                while len(buffer) >= 5:
++                    if buffer[0] != 0xA5:
++                        del buffer[0]
++                        continue
++                    if crc(buffer[:4], 0xFF, 0x8C, 8) != buffer[4]:
++                        stats['crc8_errors'] += 1
++                        del buffer[0]
++                        continue
++                    size = int.from_bytes(buffer[1:3], 'little')
++                    if size > 300:
++                        stats['invalid_length'] += 1
++                        del buffer[0]
++                        continue
++                    total = size + 9
++                    if len(buffer) < total:
++                        break
++                    frame = bytes(buffer[:total])
++                    del buffer[:total]
++                    if crc(frame[:-2], 0xFFFF, 0x8408, 16) != int.from_bytes(frame[-2:], 'little'):
++                        stats['crc16_errors'] += 1
++                        continue
++                    if frame[5:7] != b'\x10\x03':
++                        continue
++                    if size != 300:
++                        stats['invalid_length'] += 1
++                        continue
++                    block = frame[7:-2]
++                    count = block[2] | ((block[0] & 2) << 7)
++                    if count > 297 or block[0] & 0xFC:
++                        stats['invalid_length'] += 1
++                        continue
++                    if last_sequence is not None and block[1] != (last_sequence + 1) % 256:
++                        stats['sequence_gaps'] += 1
++                    last_sequence = block[1]
++                    stats['packets'] += 1
++                    stats['h264_bytes'] += count
++                    captured.extend(block[3:3 + count])
++    finally:
++        proc.send_signal(signal.SIGTERM) if proc.poll() is None else None
++        try:
++            proc.wait(timeout=8)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            proc.wait()
++        log.close()
++        os.close(master)
++        os.close(slave)
++    (output / 'received.h264').write_bytes(captured)
++    # A timed serial capture can stop halfway through a slice. Validate only
++    # completed GOPs, keeping the original capture above as evidence.
++    sps_offsets = [match.start() for match in re.finditer(b'\x00\x00(?:\x00)?\x01', captured)
++                   if match.end() < len(captured) and captured[match.end()] & 31 == 7]
++    complete = captured[:sps_offsets[-1]] if len(sps_offsets) > 1 else captured
++    (output / 'complete-gops.h264').write_bytes(complete)
++    stats['complete_gop_bytes'] = len(complete)
++    decoded = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'warning',
++                              '-r', '15', '-f', 'h264', '-i', str(output / 'complete-gops.h264'),
++                              '-f', 'null', '-'], capture_output=True, text=True)
++    (output / 'decoder.log').write_text(decoded.stderr)
++    probe = subprocess.run(['ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0',
++                            '-show_entries', 'stream=codec_name,width,height,nb_read_frames',
++                            '-of', 'json', str(output / 'complete-gops.h264')], capture_output=True, text=True)
++    # Jetson multimedia libraries sometimes print an EGL notice to stdout.
++    json_start = probe.stdout.find('{')
++    stats['stream'] = json.loads(probe.stdout[json_start:]) if json_start >= 0 else {}
++    subprocess.run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-f', 'h264',
++                    '-i', str(output / 'complete-gops.h264'), '-frames:v', '1',
++                    str(output / 'decoded.png')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    stats['bridge_returncode'] = proc.returncode
++    stats['decoder_returncode'] = decoded.returncode
++    streams = stats['stream'].get('streams', [])
++    stats['passed'] = (stats['packets'] > 100 and not any(stats[key] for key in
++                       ['crc8_errors', 'crc16_errors', 'invalid_length', 'sequence_gaps'])
++                       and bool(streams) and int(streams[0].get('nb_read_frames', '0')) > 10
++                       and decoded.returncode == 0 and proc.returncode == 0)
++    (output / 'summary.json').write_text(json.dumps(stats, indent=2) + '\n')
++    print(json.dumps(stats, indent=2))
++    print('OUTPUT=' + str(output))
++    return 0 if stats['passed'] else 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/tools/verify_serial_send.py b/tools/verify_serial_send.py
+new file mode 100644
+index 0000000..f1c6993
+--- /dev/null
++++ b/tools/verify_serial_send.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""Send to a real serial port while decoding an identical local UDP mirror.
++
++This proves host serial writes and local encoding, not receipt by the radio or client.
++"""
++import argparse
++from datetime import datetime
++import json
++from pathlib import Path
++import re
++import signal
++import socket
++import subprocess
++import time
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument('--serial', required=True)
++    p.add_argument('--duration', type=float, default=20)
++    p.add_argument('--port', type=int, default=3335)
++    args = p.parse_args()
++    root = Path(__file__).resolve().parents[1]
++    output = root / 'logs' / ('serial-send-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
++    output.mkdir(parents=True)
++    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    sock.bind(('127.0.0.1', args.port))
++    sock.settimeout(0.2)
++    log = (output / 'bridge.log').open('w')
++    proc = subprocess.Popen([str(root / 'scripts/run-onboard.sh'),
++                             '--video-serial', args.serial, '--viewer-ip', '127.0.0.1',
++                             '--viewer-port', str(args.port)], cwd=root,
++                            stdout=log, stderr=subprocess.STDOUT)
++    stats = dict(serial=args.serial, mirror_packets=0, invalid=0, sequence_gaps=0)
++    captured = bytearray()
++    last = None
++
++    def consume(block):
++        nonlocal last
++        if len(block) != 300 or block[0] & 0xFC:
++            stats['invalid'] += 1
++            return
++        count = block[2] | ((block[0] & 2) << 7)
++        if count > 297:
++            stats['invalid'] += 1
++            return
++        if last is not None and block[1] != (last + 1) % 256:
++            stats['sequence_gaps'] += 1
++        last = block[1]
++        stats['mirror_packets'] += 1
++        captured.extend(block[3:3 + count])
++
++    try:
++        deadline = time.monotonic() + args.duration
++        while time.monotonic() < deadline and proc.poll() is None:
++            try:
++                consume(sock.recv(4096))
++            except socket.timeout:
++                pass
++    finally:
++        if proc.poll() is None:
++            proc.send_signal(signal.SIGTERM)
++        try:
++            proc.wait(timeout=8)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++            proc.wait()
++        while True:
++            try:
++                consume(sock.recv(4096))
++            except socket.timeout:
++                break
++        sock.close()
++        log.close()
++    text = (output / 'bridge.log').read_text()
++    counts = re.findall(r'stopped sent=(\d+) serial_written=(\d+) serial_errors=(\d+)', text)
++    stats['sender_final'] = dict(zip(['sent', 'serial_written', 'serial_errors'], map(int, counts[-1]))) if counts else {}
++    (output / 'mirror.h264').write_bytes(captured)
++    sps = [m.start() for m in re.finditer(b'\x00\x00(?:\x00)?\x01', captured)
++           if m.end() < len(captured) and captured[m.end()] & 31 == 7]
++    complete = captured[:sps[-1]] if len(sps) > 1 else captured
++    stream = output / 'complete-gops.h264'
++    stream.write_bytes(complete)
++    decoded = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'warning', '-r', '15',
++                              '-f', 'h264', '-i', str(stream), '-f', 'null', '-'],
++                             capture_output=True, text=True)
++    (output / 'decoder.log').write_text(decoded.stderr)
++    probe = subprocess.run(['ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0',
++                            '-show_entries', 'stream=codec_name,width,height,nb_read_frames',
++                            '-of', 'json', str(stream)], capture_output=True, text=True)
++    start = probe.stdout.find('{')
++    stats['stream'] = json.loads(probe.stdout[start:]) if start >= 0 else {}
++    subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', str(stream), '-frames:v', '1',
++                    str(output / 'decoded.png')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    stats['bridge_returncode'] = proc.returncode
++    stats['decoder_returncode'] = decoded.returncode
++    stats['h264_bytes'] = len(captured)
++    final = stats['sender_final']
++    streams = stats['stream'].get('streams', [])
++    stats['passed'] = (final.get('serial_written', 0) == stats['mirror_packets'] > 100
++                       and final.get('serial_errors', -1) == stats['invalid'] == stats['sequence_gaps'] == 0
++                       and decoded.returncode == proc.returncode == 0 and bool(streams)
++                       and int(streams[0].get('nb_read_frames', '0')) > 10)
++    stats['scope'] = 'Host serial writes and local mirrored stream only; no remote acknowledgement.'
++    (output / 'summary.json').write_text(json.dumps(stats, indent=2) + '\n')
++    print(json.dumps(stats, indent=2))
++    print('OUTPUT=' + str(output))
++    return 0 if stats['passed'] else 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
